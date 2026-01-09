@@ -175,12 +175,15 @@ def build_cmd_intel_qsv(
     encoder: str,
 ):
     """
-    Conservative QSV pipeline:
-    - scale on CPU (safe)
+    QSV pipeline:
+    - init QSV device
+    - upload frames to GPU
+    - scale on QSV (scale_qsv)
     - force nv12 before QSV encoder
-    - use hevc_qsv if available else h264_qsv
     """
-    vf = scaler_for_source(src_w, src_h)
+    qsv_mode = "fast" if src_h <= 720 else "hq"
+    qsv_scale = f"scale_qsv=3840:2160:mode={qsv_mode}"
+    vf = f"format=nv12,hwupload=extra_hw_frames=64,{qsv_scale}"
 
     cmd = [
         "ffmpeg",
@@ -188,10 +191,11 @@ def build_cmd_intel_qsv(
         "-hide_banner",
         "-nostats",
         "-progress", "pipe:1",
+        "-init_hw_device", "qsv=hw",
+        "-filter_hw_device", "hw",
         "-i", str(input_path),
 
-        # Scale first, then force nv12 (QSV friendly)
-        "-vf", f"{vf},format=nv12",
+        "-vf", vf,
 
         "-c:v", encoder,
         "-global_quality", str(QSV_GLOBAL_QUALITY),
