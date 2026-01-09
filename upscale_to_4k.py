@@ -99,6 +99,19 @@ def intel_qsv_available() -> bool:
     return ffmpeg_has_encoder("hevc_qsv") or ffmpeg_has_encoder("h264_qsv")
 
 
+def qsv_encoders_available() -> list[str]:
+    encoders = []
+    if ffmpeg_has_encoder("hevc_qsv"):
+        encoders.append("hevc_qsv")
+    if ffmpeg_has_encoder("h264_qsv"):
+        encoders.append("h264_qsv")
+    return encoders
+
+
+def qsv_device_available() -> bool:
+    return Path("/dev/dri").exists()
+
+
 # ---------------- Filters ----------------
 def scaler_for_source(src_w: int, src_h: int) -> str:
     """
@@ -154,7 +167,13 @@ def build_cmd_cpu_master(input_path: Path, output_path: Path, src_w: int, src_h:
     ]
 
 
-def build_cmd_intel_qsv(input_path: Path, output_path: Path, src_w: int, src_h: int):
+def build_cmd_intel_qsv(
+    input_path: Path,
+    output_path: Path,
+    src_w: int,
+    src_h: int,
+    encoder: str,
+):
     """
     Conservative QSV pipeline:
     - scale on CPU (safe)
@@ -162,8 +181,6 @@ def build_cmd_intel_qsv(input_path: Path, output_path: Path, src_w: int, src_h: 
     - use hevc_qsv if available else h264_qsv
     """
     vf = scaler_for_source(src_w, src_h)
-
-    encoder = "h264_qsv"
 
     cmd = [
         "ffmpeg",
@@ -302,9 +319,17 @@ def main():
         return
 
     qsv_ok = intel_qsv_available()
+    qsv_device_ok = qsv_device_available()
     if MODE == "intel_qsv" and not qsv_ok:
         print("Warning: Intel QSV not detected in ffmpeg encoders. Using cpu_master.")
-    mode = MODE if (MODE != "intel_qsv" or qsv_ok) else "cpu_master"
+        print("Install a QSV-enabled ffmpeg build to use Intel Quick Sync.")
+    if MODE == "intel_qsv" and not qsv_device_ok:
+        print("Warning: /dev/dri not found. Intel GPU device is unavailable.")
+        print("Install Intel media drivers and ensure the GPU is exposed to ffmpeg.")
+    qsv_ready = qsv_ok and qsv_device_ok
+    mode = MODE if (MODE != "intel_qsv" or qsv_ready) else "cpu_master"
+
+    qsv_encoders = qsv_encoders_available() if mode == "intel_qsv" else []
 
     for video in videos:
         duration, w, h, _fps = ffprobe_info(video)
@@ -328,14 +353,23 @@ def main():
         print(f"\nEncoding: {video.name} ({w}x{h}) -> 3840x2160 | Mode: {mode}")
 
         if mode == "intel_qsv":
-            cmd = build_cmd_intel_qsv(video, out, w, h)
-            try:
-                encode_with_eta(out, cmd, duration)
-            except RuntimeError as e:
-                # If QSV fails, fall back to CPU master for this file
-                print("\nQSV failed for this file. Falling back to CPU master.")
-                print(str(e).splitlines()[-1])  # last line usually contains the key error
+            qsv_success = False
+            for encoder in qsv_encoders:
+                cmd = build_cmd_intel_qsv(video, out, w, h, encoder)
+                try:
+                    encode_with_eta(out, cmd, duration)
+                    qsv_success = True
+                    break
+                except RuntimeError as e:
+                    # Try alternate QSV encoder, then fall back to CPU
+                    print(f"\nQSV ({encoder}) failed for this file.")
+                    print(f"QSV error: {str(e).splitlines()[-1]}")  # last line usually contains the key error
 
+                    if out.exists():
+                        out.unlink()
+
+            if not qsv_success:
+                print("Falling back to CPU master.")
                 out = out_cpu
                 if out.exists():
                     print(f"Skipping CPU fallback (already exists): {out.name}")
